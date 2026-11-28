@@ -1,4 +1,5 @@
 
+import cookieParser from "cookie-parser";
 import express from "express";
 import cors from "cors";
 import { productRouter } from "./routes/product.routes.js";
@@ -6,11 +7,15 @@ import { authRouter } from "./modules/auth/auth.routes.js";
 
 export const app = express();
 
-app.use(cors({
+app.use(
+  cors({
   origin: "http://localhost:3000",
-}));
+  credentials: true,
+})
+);
 
 app.use(express.json());
+app.use(cookieParser())
 
 app.get("/api/v1/health", (_req, res) => {
   res.json({

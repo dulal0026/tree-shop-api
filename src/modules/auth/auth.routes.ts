@@ -1,6 +1,14 @@
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
-import { requestOtpController } from "./auth.controller";
+import { 
+    verifyOtpController,
+     requestOtpController,
+    logoutController } from "./auth.controller";
+
+import { requireTrustedOrigin } from "./origin.middleware.js";
+import { getCurrentCustomerController } from "./auth.controller";
+
+import { requireCustomer } from "./auth.middleware";
 
 export const authRouter = Router()
 
@@ -21,3 +29,34 @@ authRouter.post(
     otpLimiter,
     requestOtpController
 )
+
+
+const verifyOtpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many verification attempts",
+  },
+});
+
+authRouter.post(
+  "/verify-otp",
+  requireTrustedOrigin,
+  verifyOtpLimiter,
+  verifyOtpController
+);
+
+authRouter.get(
+  "/me",
+  requireCustomer,
+  getCurrentCustomerController
+);
+
+authRouter.post(
+  "/logout",
+  requireTrustedOrigin,
+  logoutController
+);

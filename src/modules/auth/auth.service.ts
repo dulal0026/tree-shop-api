@@ -1,6 +1,6 @@
 
 import { randomUUID } from "node:crypto";
-import type { PoolConnection, RowDataPacket } from "mysql2/promise";
+import type { PoolConnection, RowDataPacket, ResultSetHeader } from "mysql2/promise";
 
 import { pool } from "../../config/database.js";
 import {
@@ -8,7 +8,11 @@ import {
   hashLimitKey,
   hashOtp,
   normalizeMobileNumber,
+  verifyOtpHash
 } from "./auth.utils.js";
+
+import { generateSessionToken, hashSessionToken } from "./session.utils.js";
+import { getSessionDurationMs } from "./session.utils.js";
 import { deliverOtp } from "./otp.delivery.js";
 
 interface LimitRow extends RowDataPacket {
@@ -238,5 +242,202 @@ export async function requestOtp(
       mobileNumber,
       otp,
     });
+  }
+}
+
+
+
+interface OtpChallengeRow extends RowDataPacket {
+  id: number;
+  challenge_id: string;
+  otp_hash: string;
+  attempts: number;
+  max_attempts: number;
+  expires_at: Date;
+  consumed_at: Date | null;
+}
+
+interface CustomerRow extends RowDataPacket {
+  id: number;
+  mobile_number: string;
+  is_active: number;
+}
+
+export class InvalidOtpError extends Error {
+  constructor() {
+    super("Invalid or expired OTP");
+  }
+}
+
+export interface VerifiedCustomer {
+  id: number;
+  mobileNumber: string;
+}
+
+export interface VerifyOtpResult {
+  customer: VerifiedCustomer;
+  sessionToken: string;
+  expiresAt: Date;
+}
+
+export async function verifyCustomerOtp(
+  mobileInput: string,
+  submittedOtp: string
+): Promise<VerifyOtpResult> {
+  const mobileNumber = normalizeMobileNumber(mobileInput);
+
+  if (!/^\d{6}$/.test(submittedOtp)) {
+    throw new InvalidOtpError();
+  }
+
+  const mobileKey = hashLimitKey("mobile", mobileNumber);
+  const connection = await pool.getConnection();
+
+  let transactionOpen = false;
+
+  try {
+    await connection.beginTransaction();
+    transactionOpen = true;
+
+    // Use the same per-mobile lock as requestOtp().
+    await connection.execute(
+      `INSERT IGNORE INTO otp_mobile_locks (mobile_key)
+       VALUES (?)`,
+      [mobileKey]
+    );
+
+    await connection.execute(
+      `SELECT mobile_key
+       FROM otp_mobile_locks
+       WHERE mobile_key = ?
+       FOR UPDATE`,
+      [mobileKey]
+    );
+
+    // Read and lock the newest OTP challenge.
+    const [challenges] =
+      await connection.execute<OtpChallengeRow[]>(
+        `SELECT
+           id,
+           challenge_id,
+           otp_hash,
+           attempts,
+           max_attempts,
+           expires_at,
+           consumed_at
+         FROM customer_otp_challenges
+         WHERE mobile_number = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [mobileNumber]
+      );
+
+    const challenge = challenges[0];
+    const now = new Date();
+
+    const unavailable =
+      !challenge ||
+      challenge.consumed_at !== null ||
+      challenge.attempts >= challenge.max_attempts ||
+      new Date(challenge.expires_at).getTime() <= now.getTime();
+
+    if (unavailable) {
+      await connection.commit();
+      transactionOpen = false;
+      throw new InvalidOtpError();
+    }
+
+    const isCorrect = verifyOtpHash(
+      challenge.challenge_id,
+      submittedOtp,
+      challenge.otp_hash
+    );
+
+    if (!isCorrect) {
+      // Persist failed attempts, including the fifth failure.
+      await connection.execute(
+        `UPDATE customer_otp_challenges
+         SET attempts = attempts + 1
+         WHERE id = ?`,
+        [challenge.id]
+      );
+
+      await connection.commit();
+      transactionOpen = false;
+      throw new InvalidOtpError();
+    }
+
+    // Mark OTP consumed before creating the session.
+    await connection.execute(
+      `UPDATE customer_otp_challenges
+       SET consumed_at = ?
+       WHERE id = ?`,
+      [now, challenge.id]
+    );
+
+    // Find or create the customer atomically.
+    await connection.execute(
+      `INSERT INTO customers (
+         mobile_number,
+         mobile_verified_at
+       )
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE
+         mobile_number = mobile_number`,
+      [mobileNumber, now]
+    );
+
+    const [customers] =
+      await connection.execute<CustomerRow[]>(
+        `SELECT id, mobile_number, is_active
+         FROM customers
+         WHERE mobile_number = ?
+         FOR UPDATE`,
+        [mobileNumber]
+      );
+
+    const customer = customers[0];
+
+    if (!customer || !customer.is_active) {
+      throw new InvalidOtpError();
+    }
+
+    // Create a cryptographically secure session.
+    const sessionToken = generateSessionToken();
+    const sessionHash = hashSessionToken(sessionToken);
+
+    const expiresAt = new Date(
+      now.getTime() + getSessionDurationMs()
+    );
+
+    await connection.execute<ResultSetHeader>(
+      `INSERT INTO customer_sessions (
+         customer_id,
+         session_token_hash,
+         expires_at
+       )
+       VALUES (?, ?, ?)`,
+      [customer.id, sessionHash, expiresAt]
+    );
+
+    await connection.commit();
+    transactionOpen = false;
+
+    return {
+      customer: {
+        id: customer.id,
+        mobileNumber: customer.mobile_number,
+      },
+      sessionToken,
+      expiresAt,
+    };
+  } catch (error) {
+    if (transactionOpen) {
+      await connection.rollback();
+    }
+    throw error;
+  } finally {
+    connection.release();
   }
 }
