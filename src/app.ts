@@ -2,6 +2,7 @@
 import express from "express";
 import cors from "cors";
 import { productRouter } from "./routes/product.routes.js";
+import { authRouter } from "./modules/auth/auth.routes.js";
 
 export const app = express();
 
@@ -18,7 +19,10 @@ app.get("/api/v1/health", (_req, res) => {
   });
 });
 
+app.use("/api/v1/auth", authRouter)
 app.use("/api/v1/products", productRouter);
+
+export default app;
 
 app.use((
   error: unknown,
@@ -33,3 +37,4 @@ app.use((
     message: "Internal server error",
   });
 });
+
